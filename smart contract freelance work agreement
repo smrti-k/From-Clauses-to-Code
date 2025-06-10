@@ -1,0 +1,570 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @title FreelanceWorkAgreement
+ * @author DAO Name
+ * @notice Smart contract implementing the Freelance Work Agreement
+ */
+contract FreelanceWorkAgreement {
+    // Type declarations
+    struct Milestone {
+        string description;
+        uint256 percentage;
+        uint256 amount;
+        uint256 submissionDate;
+        uint256 approvalDeadline;
+        bool submitted;
+        bool approved;
+        bool paid;
+    }
+    
+    // State variables
+    address public client;
+    address public freelancer;
+    uint256 public totalCompensation;
+    uint256 public securityDeposit;
+    uint256 public startDate;
+    uint256 public endDate;
+    uint256 public reviewPeriod;
+    string public projectDescription;
+    uint256 public freeRevisionsPerMilestone;
+    uint256 public additionalRevisionCost;
+		uint256 public preProjectTerminationForfeitPercentage;
+    string public agreementReference;
+    string public constant VERSION = "1.0.0";
+    
+    // Deposit tracking
+    bool public clientDeposited;
+    bool public freelancerDeposited;
+    
+    // Contract state
+    bool public isActive;
+    bool public isTerminated;
+    uint256 public terminationDate;
+    string public terminationReason;
+    uint256 public activationTime;
+    
+    // Dispute tracking
+    bool public inDispute;
+    bytes32 public clientTerminationHash;
+    bytes32 public freelancerTerminationHash;
+    
+    // Array to store all milestones
+    Milestone[] public milestones;
+    
+    // Track revisions for each milestone
+    mapping(uint256 => uint256) public freeRevisionsUsed;
+    // Track pending payments for additional revisions
+		mapping(uint256 => uint256) public pendingRevisionPayments;
+    
+    // Events
+    event ContractCreated(address indexed client, address indexed freelancer, string agreementReference, uint256 timestamp);
+    event FundsDeposited(address indexed depositor, uint256 amount);
+    event ContractActivated(uint256 timestamp);
+    event MilestoneAdded(uint256 indexed milestoneId, string description, uint256 percentage, uint256 amount);
+    event MilestoneSubmitted(uint256 indexed milestoneId, uint256 timestamp, string submissionProof);
+    event ReviewStarted(uint256 indexed milestoneId, uint256 startTime, uint256 endTime);
+    event MilestoneApproved(uint256 indexed milestoneId, uint256 timestamp);
+    event MilestoneAutoApproved(uint256 indexed milestoneId, uint256 timestamp);
+    event MilestonePaid(uint256 indexed milestoneId, uint256 amount);
+    event RevisionRequested(uint256 indexed milestoneId, string description, bool additionalCostRequired);
+    event RevisionSubmitted(uint256 indexed milestoneId, uint256 timestamp, string submissionProof);
+    event AdditionalRevisionPaid(uint256 indexed milestoneId, uint256 amount);
+    event ContractTerminated(string reason, uint256 timestamp);
+    event DisputeInitiated(address indexed initiator, string reason, uint256 timestamp);
+    event DisputeResolved(uint256 clientAmount, uint256 freelancerAmount, uint256 timestamp);
+    
+    // Modifiers
+    modifier onlyClient() {
+        require(msg.sender == client, "Only the client can call this function");
+        _;
+    }
+    
+    modifier onlyFreelancer() {
+        require(msg.sender == freelancer, "Only the freelancer can call this function");
+        _;
+    }
+    
+    modifier onlyParties() {
+        require(msg.sender == client || msg.sender == freelancer, "Only contract parties can call this function");
+        _;
+    }
+    
+    modifier contractActive() {
+        require(isActive && !isTerminated, "Contract is not active");
+        _;
+    }
+    
+    modifier notInDispute() {
+        require(!inDispute, "Contract is in dispute");
+        _;
+    }
+    
+    //Constructor
+	  constructor(
+	  address _client,
+	  address _freelancer,
+	  uint256 _totalCompensation,
+	  uint256 _securityDeposit,
+	  uint256 _startDate,
+	  uint256 _endDate,
+	  uint256 _reviewPeriod,
+	  string memory _projectDescription,
+	  uint256 _freeRevisionsPerMilestone,
+	  uint256 _additionalRevisionCost,
+	  string memory _agreementReference,
+	  uint256 _preProjectTerminationForfeitPercentage
+		) {
+	  client = _client;
+	  freelancer = _freelancer;
+	  totalCompensation = _totalCompensation;
+	  securityDeposit = _securityDeposit;
+	  startDate = _startDate;
+	  endDate = _endDate;
+	  reviewPeriod = _reviewPeriod;
+	  projectDescription = _projectDescription;
+	  freeRevisionsPerMilestone = _freeRevisionsPerMilestone;
+	  additionalRevisionCost = _additionalRevisionCost;
+	  agreementReference = _agreementReference;
+	  preProjectTerminationForfeitPercentage = _preProjectTerminationForfeitPercentage;
+	    
+	  isActive = false;
+	  isTerminated = false;
+	    
+	  emit ContractCreated(client, freelancer, _agreementReference, block.timestamp);
+		}
+    
+    // External functions
+    function addMilestones(
+        string[] calldata _descriptions,
+        uint256[] calldata _percentages
+    ) external onlyClient {
+        require(milestones.length == 0, "Milestones already added");
+        require(_descriptions.length == _percentages.length, "Arrays must have same length");
+        
+        uint256 totalPercentage = 0;
+        
+        for (uint256 i = 0; i < _descriptions.length; i++) {
+            totalPercentage += _percentages[i];
+            uint256 amount = (totalCompensation * _percentages[i]) / 100;
+            
+            milestones.push(
+                Milestone({
+                    description: _descriptions[i],
+                    percentage: _percentages[i],
+                    amount: amount,
+                    submissionDate: 0,
+                    approvalDeadline: 0,
+                    submitted: false,
+                    approved: false,
+                    paid: false
+                })
+            );
+            
+            emit MilestoneAdded(i, _descriptions[i], _percentages[i], amount);
+        }
+        
+        require(totalPercentage == 100, "Percentages must sum to 100");
+    }
+    
+    function clientDeposit() external payable onlyClient {
+        require(!clientDeposited, "Client already deposited");
+        require(msg.value == totalCompensation, "Must deposit exact compensation amount");
+        
+        clientDeposited = true;
+        emit FundsDeposited(client, msg.value);
+        
+        checkActivation();
+    }
+    
+    function freelancerDeposit() external payable onlyFreelancer {
+        require(!freelancerDeposited, "Freelancer already deposited");
+        require(msg.value == securityDeposit, "Must deposit exact security amount");
+        
+        freelancerDeposited = true;
+        emit FundsDeposited(freelancer, msg.value);
+        
+        checkActivation();
+    }
+    
+    function submitMilestone(uint256 _milestoneId, string calldata _submissionProof) external onlyFreelancer contractActive notInDispute {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        require(!milestones[_milestoneId].submitted, "Milestone already submitted");
+        
+        milestones[_milestoneId].submitted = true;
+        milestones[_milestoneId].submissionDate = block.timestamp;
+        milestones[_milestoneId].approvalDeadline = block.timestamp + (reviewPeriod * 1 days);
+        
+        emit MilestoneSubmitted(_milestoneId, block.timestamp, _submissionProof);
+        emit ReviewStarted(_milestoneId, block.timestamp, milestones[_milestoneId].approvalDeadline);
+    }
+    
+    function requestRevision(uint256 _milestoneId, string calldata _description) external onlyClient contractActive notInDispute {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        require(milestones[_milestoneId].submitted, "Milestone not yet submitted");
+        require(!milestones[_milestoneId].approved, "Milestone already approved");
+        require(!milestones[_milestoneId].paid, "Milestone already paid");
+        
+        bool additionalCostRequired = freeRevisionsUsed[_milestoneId] >= freeRevisionsPerMilestone;
+        
+        if (!additionalCostRequired) {
+            freeRevisionsUsed[_milestoneId]++;
+        }
+        
+        // Reset milestone approval deadline
+        milestones[_milestoneId].approvalDeadline = block.timestamp + (reviewPeriod * 1 days);
+        
+        emit RevisionRequested(_milestoneId, _description, additionalCostRequired);
+        emit ReviewStarted(_milestoneId, block.timestamp, milestones[_milestoneId].approvalDeadline);
+    }
+    
+    function submitRevision(uint256 _milestoneId, string calldata _submissionProof) external onlyFreelancer contractActive notInDispute {
+		    require(_milestoneId < milestones.length, "Invalid milestone ID");
+		    require(milestones[_milestoneId].submitted, "Milestone not yet submitted");
+		    require(!milestones[_milestoneId].approved, "Milestone already approved");
+		    require(pendingRevisionPayments[_milestoneId] > 0, "No pending revision payment");
+		    
+		    // Reset the milestone submission date and approval deadline
+		    milestones[_milestoneId].submissionDate = block.timestamp;
+		    milestones[_milestoneId].approvalDeadline = block.timestamp + (reviewPeriod * 1 days);
+		    
+		    // Transfer the pending revision payment to the freelancer
+		    uint256 paymentAmount = pendingRevisionPayments[_milestoneId];
+		    pendingRevisionPayments[_milestoneId] = 0;
+		    
+		    (bool success, ) = payable(freelancer).call{value: paymentAmount}("");
+		    require(success, "Payment failed");
+		    
+		    emit RevisionSubmitted(_milestoneId, block.timestamp, _submissionProof);
+		    emit ReviewStarted(_milestoneId, block.timestamp, milestones[_milestoneId].approvalDeadline);
+		}
+    
+    function payForAdditionalRevision(uint256 _milestoneId) external payable onlyClient contractActive notInDispute {
+		    require(_milestoneId < milestones.length, "Invalid milestone ID");
+		    require(milestones[_milestoneId].submitted, "Milestone not yet submitted");
+		    require(!milestones[_milestoneId].approved, "Milestone already approved");
+		    require(freeRevisionsUsed[_milestoneId] >= freeRevisionsPerMilestone, "Free revisions not exhausted yet");
+		    require(msg.value == additionalRevisionCost, "Must pay exact revision cost");
+		    
+		    // Store payment instead of immediately transferring it
+		    pendingRevisionPayments[_milestoneId] += msg.value;
+		    
+		    emit AdditionalRevisionPaid(_milestoneId, additionalRevisionCost);
+    }
+    
+    function approveMilestone(uint256 _milestoneId) external onlyClient contractActive notInDispute {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        require(milestones[_milestoneId].submitted, "Milestone not yet submitted");
+        require(!milestones[_milestoneId].approved, "Milestone already approved");
+        require(!milestones[_milestoneId].paid, "Milestone already paid");
+        
+        milestones[_milestoneId].approved = true;
+        
+        emit MilestoneApproved(_milestoneId, block.timestamp);
+        
+        // Trigger payment
+        payMilestone(_milestoneId);
+    }
+    
+    function checkAutoApproval(uint256 _milestoneId) external contractActive notInDispute {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        require(milestones[_milestoneId].submitted, "Milestone not yet submitted");
+        require(!milestones[_milestoneId].approved, "Milestone already approved");
+        require(!milestones[_milestoneId].paid, "Milestone already paid");
+        require(block.timestamp > milestones[_milestoneId].approvalDeadline, "Review period not yet expired");
+        
+        milestones[_milestoneId].approved = true;
+        
+        emit MilestoneAutoApproved(_milestoneId, block.timestamp);
+        
+        // Trigger payment
+        payMilestone(_milestoneId);
+    }
+    
+    function terminatePreProject() external onlyParties notInDispute {
+		    require(isActive, "Contract not active");
+		    require(!isTerminated, "Contract already terminated");
+		    require(block.timestamp < startDate, "Project already started");
+		    
+		    isTerminated = true;
+		    terminationDate = block.timestamp;
+		    
+		    if (msg.sender == client) {
+		       // Client initiated termination
+		        terminationReason = "Pre-project termination by client";
+		        
+		        // Client forfeits configurable percentage, freelancer gets full refund
+		        uint256 forfeitAmount = (totalCompensation * preProjectTerminationForfeitPercentage) / 100;
+		        uint256 refundAmount = totalCompensation - forfeitAmount;
+		        
+		        // Pay freelancer first, then refund client
+		        (bool freelancerRefundSuccess, ) = payable(freelancer).call{value: securityDeposit + forfeitAmount}("");
+		        require(freelancerRefundSuccess, "Freelancer refund failed");
+		        
+		        (bool clientRefundSuccess, ) = payable(client).call{value: refundAmount}("");
+		        require(clientRefundSuccess, "Client refund failed");
+		    } else {
+		        // Freelancer initiated termination
+		        terminationReason = "Pre-project termination by freelancer";
+		        
+		        // Freelancer forfeits configurable percentage, client gets full refund
+		        uint256 forfeitAmount = (securityDeposit * preProjectTerminationForfeitPercentage) / 100;
+		        uint256 refundAmount = securityDeposit - forfeitAmount;
+		        
+		        // Refund client first, then freelancer
+		        (bool clientRefundSuccess, ) = payable(client).call{value: totalCompensation + forfeitAmount}("");
+		        require(clientRefundSuccess, "Client refund failed");
+		        
+		        (bool freelancerRefundSuccess, ) = payable(freelancer).call{value: refundAmount}("");
+		        require(freelancerRefundSuccess, "Freelancer refund failed");
+		    }
+		    
+		    emit ContractTerminated(terminationReason, terminationDate);
+		}
+		    
+    function clientTerminateAfterStart() external onlyClient contractActive notInDispute {
+        require(block.timestamp >= startDate, "Project has not started yet");
+        
+        isTerminated = true;
+        terminationDate = block.timestamp;
+        terminationReason = "Mid-project termination by client";
+        
+        // Calculate amount already paid and pay for approved milestones
+        uint256 paidAmount = getCompletedPayments();
+        payApprovedMilestones();
+        
+        // Refund client and freelancer
+        uint256 clientRefund = totalCompensation - paidAmount;
+        
+        // Return security deposit to freelancer first, then refund client
+        (bool freelancerRefundSuccess, ) = payable(freelancer).call{value: securityDeposit}("");
+        require(freelancerRefundSuccess, "Freelancer refund failed");
+        
+        (bool clientRefundSuccess, ) = payable(client).call{value: clientRefund}("");
+        require(clientRefundSuccess, "Client refund failed");
+        
+        emit ContractTerminated(terminationReason, terminationDate);
+    }
+    
+    function freelancerTerminateAfterStart() external onlyFreelancer contractActive notInDispute {
+        require(block.timestamp >= startDate, "Project has not started yet");
+        
+        isTerminated = true;
+        terminationDate = block.timestamp;
+        terminationReason = "Mid-project termination by freelancer";
+        
+        // Calculate amount already paid and pay for approved milestones
+        uint256 paidAmount = getCompletedPayments();
+        payApprovedMilestones();
+        
+        // Get updated paid amount after paying approved milestones
+        paidAmount = getCompletedPayments();
+        
+        // Freelancer forfeits percentage of security deposit
+        uint256 forfeitAmount = (securityDeposit * 50) / 100; // 50% example
+        uint256 freelancerRefundAmount = securityDeposit - forfeitAmount;
+        
+        // Refund client first with unpaid amount + forfeit, then freelancer
+        uint256 clientRefund = totalCompensation - paidAmount + forfeitAmount;
+        
+        (bool clientRefundSuccess, ) = payable(client).call{value: clientRefund}("");
+        require(clientRefundSuccess, "Client refund failed");
+        
+        (bool freelancerRefundSuccess, ) = payable(freelancer).call{value: freelancerRefundAmount}("");
+        require(freelancerRefundSuccess, "Freelancer refund failed");
+        
+        emit ContractTerminated(terminationReason, terminationDate);
+    }
+    
+    function terminateForNonPerformance(string calldata _reason) external onlyClient contractActive notInDispute {
+        isTerminated = true;
+        terminationDate = block.timestamp;
+        terminationReason = string(abi.encodePacked("Termination for non-performance: ", _reason));
+        
+        // Calculate amount already paid
+        uint256 paidAmount = getCompletedPayments();
+        
+        // Entire security deposit goes to client
+        uint256 clientRefund = totalCompensation - paidAmount + securityDeposit;
+        
+        (bool clientRefundSuccess, ) = payable(client).call{value: clientRefund}("");
+        require(clientRefundSuccess, "Client refund failed");
+        
+        emit ContractTerminated(terminationReason, terminationDate);
+    }
+    
+    function mutualTermination() external onlyParties contractActive notInDispute {
+        bytes32 terminationHash = keccak256(abi.encodePacked("mutual_termination", block.chainid, address(this)));
+        
+        if (msg.sender == client) {
+            clientTerminationHash = terminationHash;
+        } else if (msg.sender == freelancer) {
+            freelancerTerminationHash = terminationHash;
+        }
+        
+        // Check if both parties have called the function
+        if (clientTerminationHash == terminationHash && freelancerTerminationHash == terminationHash) {
+            isTerminated = true;
+            terminationDate = block.timestamp;
+            terminationReason = "Mutual termination";
+            
+            // Calculate amount already paid and pay for approved milestones
+            uint256 paidAmount = getCompletedPayments();
+            payApprovedMilestones();
+            
+            // Get updated paid amount after paying approved milestones
+            paidAmount = getCompletedPayments();
+            
+            // Refund client and freelancer
+            uint256 clientRefund = totalCompensation - paidAmount;
+            
+            // Return security deposit to freelancer first, then refund client
+            (bool freelancerRefundSuccess, ) = payable(freelancer).call{value: securityDeposit}("");
+            require(freelancerRefundSuccess, "Freelancer refund failed");
+            
+            (bool clientRefundSuccess, ) = payable(client).call{value: clientRefund}("");
+            require(clientRefundSuccess, "Client refund failed");
+            
+            emit ContractTerminated(terminationReason, terminationDate);
+        }
+    }
+    
+    function recordDispute(string calldata _reason) external onlyParties contractActive {
+        inDispute = true;
+        emit DisputeInitiated(msg.sender, _reason, block.timestamp);
+    }
+    
+    function executeKlerosVerdict(uint256 _clientAmount, uint256 _freelancerAmount) external {
+        require(msg.sender == client || msg.sender == freelancer, "Unauthorized");
+        require(inDispute, "No active dispute");
+        require(_clientAmount + _freelancerAmount <= address(this).balance, "Insufficient contract balance");
+        
+        // Resolve dispute and terminate contract
+        inDispute = false;
+        isTerminated = true;
+        terminationDate = block.timestamp;
+        terminationReason = "Terminated by Kleros verdict";
+        
+        // Transfer funds according to verdict
+        if (_clientAmount > 0) {
+            (bool clientSuccess, ) = payable(client).call{value: _clientAmount}("");
+            require(clientSuccess, "Client payment failed");
+        }
+        
+        if (_freelancerAmount > 0) {
+            (bool freelancerSuccess, ) = payable(freelancer).call{value: _freelancerAmount}("");
+            require(freelancerSuccess, "Freelancer payment failed");
+        }
+        
+        emit DisputeResolved(_clientAmount, _freelancerAmount, block.timestamp);
+        emit ContractTerminated(terminationReason, terminationDate);
+    }
+    
+    // Internal functions
+    function checkActivation() internal {
+        if (clientDeposited && freelancerDeposited && !isActive) {
+            isActive = true;
+            activationTime = block.timestamp;
+            emit ContractActivated(activationTime);
+        }
+    }
+    
+    function payMilestone(uint256 _milestoneId) internal {
+        require(milestones[_milestoneId].approved, "Milestone not approved");
+        require(!milestones[_milestoneId].paid, "Milestone already paid");
+        
+        // Set paid status first (Checks-Effects-Interactions pattern)
+        milestones[_milestoneId].paid = true;
+        
+        // Transfer milestone amount to freelancer
+        uint256 amount = milestones[_milestoneId].amount;
+        (bool success, ) = payable(freelancer).call{value: amount}("");
+        require(success, "Payment failed");
+        
+        emit MilestonePaid(_milestoneId, amount);
+    }
+    
+    // Split the function to avoid stack too deep error
+    function getCompletedPayments() internal view returns (uint256) {
+        uint256 paidAmount = 0;
+        for (uint256 i = 0; i < milestones.length; i++) {
+            if (milestones[i].paid) {
+                paidAmount += milestones[i].amount;
+            }
+        }
+        return paidAmount;
+    }
+    
+    function payApprovedMilestones() internal {
+        for (uint256 i = 0; i < milestones.length; i++) {
+            if (milestones[i].approved && !milestones[i].paid) {
+                // Set paid status first
+                milestones[i].paid = true;
+                
+                // Transfer milestone amount
+                uint256 amount = milestones[i].amount;
+                (bool success, ) = payable(freelancer).call{value: amount}("");
+                require(success, "Payment failed");
+                
+                emit MilestonePaid(i, amount);
+            }
+        }
+    }
+    
+    // View/pure functions
+    function getContractStatus() external view returns (
+        bool _isActive,
+        bool _isTerminated,
+        uint256 _contractBalance,
+        uint256 _milestonesCount,
+        uint256 _completedMilestones
+    ) {
+        uint256 completedCount = 0;
+        for (uint256 i = 0; i < milestones.length; i++) {
+            if (milestones[i].paid) {
+                completedCount++;
+            }
+        }
+        
+        return (
+            isActive,
+            isTerminated,
+            address(this).balance,
+            milestones.length,
+            completedCount
+        );
+    }
+    
+    function getMilestoneDetails(uint256 _milestoneId) external view returns (
+        string memory _description,
+        uint256 _percentage,
+        uint256 _amount,
+        uint256 _submissionDate,
+        uint256 _approvalDeadline,
+        bool _submitted,
+        bool _approved,
+        bool _paid
+    ) {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        
+        Milestone storage m = milestones[_milestoneId];
+        
+        return (
+            m.description,
+            m.percentage,
+            m.amount,
+            m.submissionDate,
+            m.approvalDeadline,
+            m.submitted,
+            m.approved,
+            m.paid
+        );
+    }
+    
+    // Separate function to get free revisions to avoid stack too deep error
+    function getMilestoneRevisions(uint256 _milestoneId) external view returns (uint256) {
+        require(_milestoneId < milestones.length, "Invalid milestone ID");
+        return freeRevisionsUsed[_milestoneId];
+    }
+}
